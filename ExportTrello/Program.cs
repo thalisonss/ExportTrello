@@ -25,160 +25,199 @@ class TrelloConfig
     public string BoardId { get; set; }
 }
 
+static class Logger
+{
+    private static readonly object Sync = new();
+    private static readonly string LogFilePath = Path.Combine(Environment.CurrentDirectory, "logs", "export_trello.log");
+
+    public static void Info(string message) => Write("INFO", message);
+
+    public static void Error(string message, Exception? exception = null)
+    {
+        var fullMessage = exception == null
+            ? message
+            : $"{message}{Environment.NewLine}{exception}";
+
+        Write("ERROR", fullMessage);
+    }
+
+    private static void Write(string level, string message)
+    {
+        var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{level}] {message}";
+
+        Console.WriteLine(line);
+
+        lock (Sync)
+        {
+            var logDirectory = Path.GetDirectoryName(LogFilePath);
+            if (!string.IsNullOrWhiteSpace(logDirectory))
+                Directory.CreateDirectory(logDirectory);
+
+            File.AppendAllText(LogFilePath, line + Environment.NewLine);
+        }
+    }
+}
+
 class Program
 {
     static async Task Main()
     {
-
-
-
-        var configuration = new ConfigurationBuilder()
-    .SetBasePath(AppContext.BaseDirectory)
-    .AddJsonFile("appsettings.json", optional: false)
-    .Build();
-
-        var trelloConfig = configuration
-            .GetSection("Trello")
-            .Get<TrelloConfig>();
-
-        string key = trelloConfig.Key;
-        string token = trelloConfig.Token;
-        string boardId = trelloConfig.BoardId;
-
-        using HttpClient client = new HttpClient();
-
-        Console.WriteLine("Baixando dados do board...");
-
-        string boardUrl =
-        $"https://api.trello.com/1/boards/{boardId}?cards=all&lists=all&key={key}&token={token}";
-
-        string boardJson = await client.GetStringAsync(boardUrl);
-
-        JObject board = JObject.Parse(boardJson);
-
-        var lists = board["lists"]
-            .ToDictionary(
-                l => l["id"].ToString(),
-                l => l["name"].ToString()
-            );
-
-        var cards = board["cards"]
-            .Select(c => new
-            {
-                Id = c["id"].ToString(),
-                Nome = c["name"].ToString(),
-                ListaId = c["idList"].ToString(),
-                Labels = string.Join(", ",
-                    c["labels"].Select(l => l["name"]?.ToString()).Where(x => !string.IsNullOrWhiteSpace(x)))
-            })
-            .ToList();
-
-        Console.WriteLine("Baixando histórico de movimentações...");
-
-        string actionsUrl =
-        $"https://api.trello.com/1/boards/{boardId}/actions?filter=updateCard:idList&limit=1000&key={key}&token={token}";
-
-        string actionsJson = await client.GetStringAsync(actionsUrl);
-
-        JArray actions = JArray.Parse(actionsJson);
-
-        var andamentoPorCard = new Dictionary<string, DateTime>();
-        var concluidoPorCard = new Dictionary<string, DateTime>();
-
-        foreach (var action in actions)
+        try
         {
-            var data = action["data"];
+            var configuration = new ConfigurationBuilder()
+                .SetBasePath(AppContext.BaseDirectory)
+                .AddJsonFile("appsettings.json", optional: false)
+                .Build();
 
-            if (data["listAfter"] == null)
-                continue;
+            var trelloConfig = configuration
+                .GetSection("Trello")
+                .Get<TrelloConfig>();
 
-            string listName = data["listAfter"]["name"].ToString().ToLower();
-            string cardId = data["card"]["id"].ToString();
-            DateTime date = DateTime.Parse(action["date"].ToString());
+            string key = trelloConfig.Key;
+            string token = trelloConfig.Token;
+            string boardId = trelloConfig.BoardId;
 
-            if (listName.Contains("andamento"))
+            using HttpClient client = new HttpClient();
+
+            Logger.Info("Baixando dados do board...");
+
+            string boardUrl =
+                $"https://api.trello.com/1/boards/{boardId}?cards=all&lists=all&key={key}&token={token}";
+
+            string boardJson = await client.GetStringAsync(boardUrl);
+
+            JObject board = JObject.Parse(boardJson);
+
+            var lists = board["lists"]
+                .ToDictionary(
+                    l => l["id"].ToString(),
+                    l => l["name"].ToString()
+                );
+
+            var cards = board["cards"]
+                .Select(c => new
+                {
+                    Id = c["id"].ToString(),
+                    Nome = c["name"].ToString(),
+                    ListaId = c["idList"].ToString(),
+                    Labels = string.Join(", ",
+                        c["labels"].Select(l => l["name"]?.ToString()).Where(x => !string.IsNullOrWhiteSpace(x)))
+                })
+                .ToList();
+
+            Logger.Info("Baixando histÃ³rico de movimentaÃ§Ãµes...");
+
+            string actionsUrl =
+                $"https://api.trello.com/1/boards/{boardId}/actions?filter=updateCard:idList&limit=1000&key={key}&token={token}";
+
+            string actionsJson = await client.GetStringAsync(actionsUrl);
+
+            JArray actions = JArray.Parse(actionsJson);
+
+            var andamentoPorCard = new Dictionary<string, DateTime>();
+            var concluidoPorCard = new Dictionary<string, DateTime>();
+
+            foreach (var action in actions)
             {
-                if (!andamentoPorCard.ContainsKey(cardId))
-                    andamentoPorCard.Add(cardId, date);
+                var data = action["data"];
+
+                if (data["listAfter"] == null)
+                    continue;
+
+                string listName = data["listAfter"]["name"].ToString().ToLower();
+                string cardId = data["card"]["id"].ToString();
+                DateTime date = DateTime.Parse(action["date"].ToString());
+
+                if (listName.Contains("andamento"))
+                {
+                    if (!andamentoPorCard.ContainsKey(cardId))
+                        andamentoPorCard.Add(cardId, date);
+                }
+
+                if (listName.Contains("concluido"))
+                {
+                    if (!concluidoPorCard.ContainsKey(cardId))
+                        concluidoPorCard.Add(cardId, date);
+                }
             }
 
-            if (listName.Contains("concluido"))
+            Logger.Info("Processando cards...");
+
+            var resultado = new List<CardResultado>();
+
+            foreach (var card in cards)
             {
-                if (!concluidoPorCard.ContainsKey(cardId))
-                    concluidoPorCard.Add(cardId, date);
+                DateTime criado = GetCreationDate(card.Id);
+
+                DateTime? andamento = null;
+                DateTime? concluido = null;
+
+                if (andamentoPorCard.ContainsKey(card.Id))
+                    andamento = andamentoPorCard[card.Id];
+
+                if (concluidoPorCard.ContainsKey(card.Id))
+                    concluido = concluidoPorCard[card.Id];
+
+                resultado.Add(new CardResultado
+                {
+                    Card = card.Nome,
+                    ListaAtual = lists[card.ListaId],
+                    Criado = criado,
+                    EmAndamento = andamento,
+                    Concluido = concluido,
+                    Etiquetas = card.Labels
+                });
             }
-        }
 
-        Console.WriteLine("Processando cards...");
+            Logger.Info("Gerando Excel...");
 
-        var resultado = new List<CardResultado>();
+            using var workbook = new XLWorkbook();
+            var ws = workbook.Worksheets.Add("Cards");
 
-        foreach (var card in cards)
-        {
-            DateTime criado = GetCreationDate(card.Id);
+            ws.Cell(1, 1).Value = "Card";
+            ws.Cell(1, 2).Value = "Lista Atual";
+            ws.Cell(1, 3).Value = "Criado";
+            ws.Cell(1, 4).Value = "Entrou Em Andamento";
+            ws.Cell(1, 5).Value = "Entrou Concluido";
+            ws.Cell(1, 6).Value = "Etiquetas";
 
-            DateTime? andamento = null;
-            DateTime? concluido = null;
+            int row = 2;
 
-            if (andamentoPorCard.ContainsKey(card.Id))
-                andamento = andamentoPorCard[card.Id];
-
-            if (concluidoPorCard.ContainsKey(card.Id))
-                concluido = concluidoPorCard[card.Id];
-
-            resultado.Add(new CardResultado
+            foreach (var r in resultado)
             {
-                Card = card.Nome,
-                ListaAtual = lists[card.ListaId],
-                Criado = criado,
-                EmAndamento = andamento,
-                Concluido = concluido,
-                Etiquetas = card.Labels
-            });
+                ws.Cell(row, 1).Value = r.Card;
+                ws.Cell(row, 2).Value = r.ListaAtual;
+                ws.Cell(row, 3).Value = r.Criado;
+
+                if (r.EmAndamento.HasValue)
+                    ws.Cell(row, 4).Value = r.EmAndamento.Value;
+
+                if (r.Concluido.HasValue)
+                    ws.Cell(row, 5).Value = r.Concluido.Value;
+
+                ws.Cell(row, 6).Value = r.Etiquetas;
+
+                row++;
+            }
+
+            ws.Column(3).Style.DateFormat.Format = "dd/MM/yyyy HH:mm";
+            ws.Column(4).Style.DateFormat.Format = "dd/MM/yyyy HH:mm";
+            ws.Column(5).Style.DateFormat.Format = "dd/MM/yyyy HH:mm";
+
+            ws.Columns().AdjustToContents();
+
+            string file = Path.Combine(Environment.CurrentDirectory, "trello_export.xlsx");
+
+            workbook.SaveAs(file);
+
+            Logger.Info($"Planilha criada: {file}");
+            Logger.Info($"Logs gravados em: {Path.Combine(Environment.CurrentDirectory, "logs", "export_trello.log")}");
         }
-
-        Console.WriteLine("Gerando Excel...");
-
-        using var workbook = new XLWorkbook();
-        var ws = workbook.Worksheets.Add("Cards");
-
-        ws.Cell(1, 1).Value = "Card";
-        ws.Cell(1, 2).Value = "Lista Atual";
-        ws.Cell(1, 3).Value = "Criado";
-        ws.Cell(1, 4).Value = "Entrou Em Andamento";
-        ws.Cell(1, 5).Value = "Entrou Concluido";
-        ws.Cell(1, 6).Value = "Etiquetas";
-
-        int row = 2;
-
-        foreach (var r in resultado)
+        catch (Exception ex)
         {
-            ws.Cell(row, 1).Value = r.Card;
-            ws.Cell(row, 2).Value = r.ListaAtual;
-            ws.Cell(row, 3).Value = r.Criado;
-
-            if (r.EmAndamento.HasValue)
-                ws.Cell(row, 4).Value = r.EmAndamento.Value;
-
-            if (r.Concluido.HasValue)
-                ws.Cell(row, 5).Value = r.Concluido.Value;
-
-            ws.Cell(row, 6).Value = r.Etiquetas;
-
-            row++;
+            Logger.Error("Erro durante a exportaÃ§Ã£o do Trello.", ex);
+            throw;
         }
-
-        ws.Column(3).Style.DateFormat.Format = "dd/MM/yyyy HH:mm";
-        ws.Column(4).Style.DateFormat.Format = "dd/MM/yyyy HH:mm";
-        ws.Column(5).Style.DateFormat.Format = "dd/MM/yyyy HH:mm";
-
-        ws.Columns().AdjustToContents();
-
-        string file = Path.Combine(Environment.CurrentDirectory, "trello_export.xlsx");
-
-        workbook.SaveAs(file);
-
-        Console.WriteLine($"Planilha criada: {file}");
     }
 
     static DateTime GetCreationDate(string cardId)
