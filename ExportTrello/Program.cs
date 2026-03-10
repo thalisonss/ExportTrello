@@ -25,6 +25,12 @@ class TrelloConfig
     public string BoardId { get; set; }
 }
 
+class ExportConfig
+{
+    public string OutputDirectory { get; set; } = Environment.CurrentDirectory;
+    public string FileNamePattern { get; set; } = "trello_export_{date}.xlsx";
+}
+
 static class Logger
 {
     private static readonly object Sync = new();
@@ -72,6 +78,10 @@ class Program
             var trelloConfig = configuration
                 .GetSection("Trello")
                 .Get<TrelloConfig>();
+
+            var exportConfig = configuration
+                .GetSection("Export")
+                .Get<ExportConfig>() ?? new ExportConfig();
 
             string key = trelloConfig.Key;
             string token = trelloConfig.Token;
@@ -206,7 +216,17 @@ class Program
 
             ws.Columns().AdjustToContents();
 
-            string file = Path.Combine(Environment.CurrentDirectory, "trello_export.xlsx");
+            string fileName = exportConfig.FileNamePattern
+                .Replace("{date}", DateTime.Now.ToString("yyyy-MM-dd"))
+                .Replace("{datetime}", DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss"));
+
+            string outputDirectory = string.IsNullOrWhiteSpace(exportConfig.OutputDirectory)
+                ? Environment.CurrentDirectory
+                : exportConfig.OutputDirectory;
+
+            Directory.CreateDirectory(outputDirectory);
+
+            string file = Path.Combine(outputDirectory, fileName);
 
             workbook.SaveAs(file);
 
